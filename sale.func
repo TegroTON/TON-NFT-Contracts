@@ -1,0 +1,160 @@
+;; NFT sale smart contract
+;; Updated and largely improved
+
+int min_gas_amount() asm "1000000000 PUSHINT"; ;; 1 TON
+
+(slice, slice, slice, int, cell) load_data() inline {
+    var ds = get_data().begin_parse();
+    return
+            (ds~load_msg_addr(), ;; marketplace_address
+                    ds~load_msg_addr(), ;; nft_address
+                    ds~load_msg_addr(), ;; nft_owner_address
+                    ds~load_coins(), ;; full_price
+                    ds~load_ref() ;; fees_cell
+            );
+}
+
+(int, slice, int) load_fees(cell fees_cell) inline {
+    var ds = fees_cell.begin_parse();
+    return
+            (ds~load_coins(), ;; marketplace_fee,
+                    ds~load_msg_addr(), ;; royalty_address
+                    ds~load_coins() ;; royalty_amount
+            );
+}
+
+() buy(int my_balance, slice marketplace_address, slice nft_address, slice nft_owner_address, int full_price, cell fees_cell, int msg_value, slice sender_address, int query_id) impure {
+    throw_unless(450, msg_value >= full_price + min_gas_amount());
+
+    var (marketplace_fee, royalty_address, royalty_amount) = load_fees(fees_cell);
+
+    var owner_msg = begin_cell()
+            .store_uint(0x10, 6) ;; nobounce
+            .store_slice(nft_owner_address)
+            .store_coins(full_price - marketplace_fee - royalty_amount + (my_balance - msg_value))
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    send_raw_message(owner_msg.end_cell(), 1);
+
+
+    var royalty_msg = begin_cell()
+            .store_uint(0x10, 6) ;; nobounce
+            .store_slice(royalty_address)
+            .store_coins(royalty_amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    send_raw_message(royalty_msg.end_cell(), 1);
+
+
+    var marketplace_msg = begin_cell()
+            .store_uint(0x10, 6) ;; nobounce
+            .store_slice(marketplace_address)
+            .store_coins(marketplace_fee)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    send_raw_message(marketplace_msg.end_cell(), 1);
+
+    var nft_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(nft_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::transfer(), 32)
+            .store_uint(query_id, 64)
+            .store_slice(sender_address) ;; new_owner_address
+            .store_slice(sender_address) ;; response_address
+            .store_int(0, 1) ;; empty custom_payload
+            .store_coins(0) ;; forward amount to new_owner_address
+            .store_int(0, 1); ;; empty forward_payload
+
+    send_raw_message(nft_msg.end_cell(), 128 + 32);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    var (marketplace_address, nft_address, nft_owner_address, full_price, fees_cell) = load_data();
+
+    if (equal_slices(marketplace_address, sender_address)) {
+        return (); ;; just accept coins on deploy
+    }
+
+    int op = 0;
+    int query_id = 0;
+
+    if (in_msg_body.slice_empty?()) {
+        op = 2; ;; empty text messages default to buying stuff
+    } else {
+        op = in_msg_body~load_uint(32);
+
+        if(op == 0) { ;; a text command
+            int first_character = in_msg_body~load_uint(8);
+            if(first_character == 0x62) { ;; 'b'
+                throw_unless(0xB000, in_msg_body~load_uint(16) == 0x7579); ;; 'uy'
+                op = 2; ;; buy command
+            }
+            if(first_character == 0x63) { ;; 'c'
+                throw_unless(0xB000, in_msg_body~load_uint(40) == 0x616e63656c); ;; 'ancel'
+                op = 3; ;; cancel sale
+            }
+            ;; well idk just see what happens
+        } else {
+            query_id = in_msg_body~load_uint(64);
+        }
+    }
+
+    if(op == 1) {
+        return (); ;; accept coins
+    }
+
+    if (op == 2) { ;; buy
+        buy(my_balance, marketplace_address, nft_address, nft_owner_address, full_price, fees_cell, msg_value, sender_address, query_id);
+
+        return ();
+    }
+
+    if (op == 3) { ;; cancel sale
+        throw_unless(457, msg_value >= min_gas_amount());
+        throw_unless(458, equal_slices(sender_address, nft_owner_address) | equal_slices(sender_address, marketplace_address));
+
+        var msg = begin_cell()
+                .store_uint(0x10, 6) ;; nobounce
+                .store_slice(nft_address)
+                .store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::transfer(), 32)
+                .store_uint(query_id, 64)
+                .store_slice(nft_owner_address) ;; new_owner_address
+                .store_slice(nft_owner_address) ;; response_address;
+                .store_int(0, 1) ;; empty custom_payload
+                .store_coins(0) ;; forward amount to new_owner_address
+                .store_int(0, 1); ;; empty forward_payload
+
+        send_raw_message(msg.end_cell(), 128 + 32);
+
+        return ();
+    }
+
+    ;; When item is first transferred to this contract, excess coins are sent here
+    if(op == op::excesses()) {
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+() recv_external(slice in_msg) impure {
+}
+
+(slice, slice, slice, int, int, slice, int) get_sale_data() method_id {
+    var (marketplace_address, nft_address, nft_owner_address, full_price, fees_cell) = load_data();
+    var (marketplace_fee, royalty_address, royalty_amount) = load_fees(fees_cell);
+    return (marketplace_address, nft_address, nft_owner_address, full_price, marketplace_fee, royalty_address, royalty_amount);
+}
